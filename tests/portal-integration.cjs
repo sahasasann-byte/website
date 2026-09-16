@@ -1,0 +1,41 @@
+// Local API integration tests. Uses real SQLite, isolated R2 bytes and test identities.
+// Does not claim to test production ChatGPT authentication or deployed Cloudflare storage.
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict'),ts=require('typescript');
+const {DatabaseSync}=require('node:sqlite');
+const sql=new DatabaseSync(':memory:');for(const f of fs.readdirSync('drizzle').filter(f=>f.endsWith('.sql')).sort())sql.exec(fs.readFileSync('drizzle/'+f,'utf8'));
+const DB={prepare(query){let params=[];return{bind(...p){params=p;return this},async first(){return sql.prepare(query).get(...params)||null},async all(){return {results:sql.prepare(query).all(...params)}},async run(){return sql.prepare(query).run(...params)}}},async batch(statements){sql.exec('BEGIN');try{const r=[];for(const s of statements)r.push(await s.run());sql.exec('COMMIT');return r}catch(e){sql.exec('ROLLBACK');throw e}}};
+const blobs=new Map(),BUCKET={async put(k,b){blobs.set(k,b)},async get(k){return blobs.has(k)?{body:blobs.get(k)}:null},async delete(k){blobs.delete(k)}};
+let user=null;const env={DB,BUCKET,BROKER_EMAILS:'broker@example.test'};
+function moduleCode(path,imports){const source=ts.transpileModule(fs.readFileSync(path,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;const exports={};vm.runInNewContext(source,{exports,require:n=>{if(!(n in imports))throw Error('Unknown import '+n);return imports[n]},crypto,Request,Response,File,TextDecoder,Uint8Array,console,URL,Date,Number});return exports}
+const portal=moduleCode('lib/portal.ts',{'cloudflare:workers':{env}});
+const route=moduleCode('app/api/portal/route.ts',{'../../chatgpt-auth':{getChatGPTUser:async()=>user},'@/lib/portal':portal});
+const who=(id,email=id+'@example.test')=>user={userId:id,email,fullName:'Local QA',displayName:'Local QA'};
+const base='https://kingbro.example.test';
+async function get(section='workspace'){return route.GET(new Request(base+'/api/portal?section='+section))}
+async function post(body,origin=base){const form=body instanceof FormData;return route.POST(new Request(base+'/api/portal',{method:'POST',headers:{Origin:origin,...(!form&&{'Content-Type':'application/json'})},body:form?body:JSON.stringify(body)}))}
+let count=0;function check(condition,message){assert(condition,message);count++;console.log('PASS '+message)}
+(async()=>{
+check((await get()).status===401,'Anonymous access denied');who('alice');
+check((await get('admin')).status===403,'Customer cannot read broker workspace');
+check((await post({action:'profile',name:'Alice',contact:'Email'},'https://evil.test')).status===403,'Cross-origin writes denied');
+let ids={};for(const mode of ['Buy','Sell','Rent','Give for Rent']){const r=await post({action:'submit',mode,type:'House',location:['Buy','Rent'].includes(mode)?'Kochi':'',budget:50000,size:'2 BHK',notes:'Isolated QA data',name:'QA Alice',phone:'0000000000',consent:true});check(r.status===200,mode+' saved with correct location requirement');ids[mode]=(await r.json()).id;}
+check((await post({action:'submit',mode:'Buy',type:'House',location:'',budget:5,name:'QA',phone:'0000000000',consent:true})).status===400,'Buyer location required server-side');
+check((await post({action:'submit',mode:'Sell',type:'House',budget:-1,name:'QA',phone:'0000000000',consent:true})).status===400,'Negative budget rejected');
+const id=ids.Buy;
+check((await (await get()).json()).requests.length===4,'All requests retrieved from SQLite');
+check((await post({action:'appointment',id,date:new Date(Date.now()+86400000).toISOString(),kind:'Site visit',note:'Local test'})).status===200,'Appointment persisted');
+check((await post({action:'ticket',subject:'Local QA',message:'Test support record'})).status===200,'Support ticket persisted');
+check((await post({action:'profile',name:'QA Alice',phone:'0000000000',contact:'Email'})).status===200,'Profile persisted');
+let form=new FormData();form.set('request',id);form.set('file',new File(['%PDF-1.4\nLocal test\n%%EOF'], 'qa.pdf',{type:'application/pdf'}));const upload=await post(form);check(upload.status===200,'Private document stored with metadata');const fid=(await upload.json()).id;
+check((await get('file&id='+fid)).status===200,'Owner can retrieve document');
+form=new FormData();form.set('request',id);form.set('file',new File(['not a png'],'spoof.png',{type:'image/png'}));check((await post(form)).status===400,'MIME spoof rejected');
+who('bob');check((await get('detail&id='+id)).status===404,'Other customer cannot read request');check((await get('file&id='+fid)).status===404,'Other customer cannot download document');check((await (await get()).json()).requests.length===0,'Customer list isolated');check((await post({action:'status',id,status:'Closed'})).status===403,'Customer cannot mutate broker status');
+const br=await post({action:'submit',mode:'Sell',type:'House',budget:50000,name:'QA Bob',phone:'0000000000',consent:true});const seller=(await br.json()).id;
+who('broker','broker@example.test');check((await get('admin')).status===200,'Authorised broker can read workspace');check((await post({action:'status',id,status:'Matching',note:'Review complete'})).status===200,'Broker updates customer timeline');check((await post({action:'note',id,note:'Confidential staff note'})).status===200,'Internal note stored');check((await post({action:'match',id,seller})).status===200,'Manual compatible match stored');check((await post({action:'commission',id,value:5000000,rate:2,received:10000})).status===200,'Commission ledger stored');
+const admin=await (await get('admin')).json();check((await post({action:'confirmAppointment',id:admin.appointments[0].id,status:'Confirmed'})).status===200,'Broker confirms appointment');check((await post({action:'reply',id:admin.tickets[0].id,reply:'Local QA response'})).status===200,'Broker replies to ticket');
+who('alice');const detail=await (await get('detail&id='+id)).json();check(detail.request.status==='Matching','Customer sees actual saved progress');check(!detail.events.some(x=>x.internal||x.note==='Confidential staff note'),'Staff notes excluded from customer response');check(detail.appointments[0].status==='Confirmed','Customer sees confirmed appointment');check((await post({action:'withdraw',id})).status===200,'Owner can withdraw own request');
+for(const state of ['Kerala','Tamil Nadu','Karnataka']){const response=await post({action:'submit',mode:'Give for Rent',type:'Villa',state,location:'Private lane',budget:50000,name:'QA Alice',phone:'+91 9000000000',consent:true,details:{district:'QA district',address:'Private address',pincode:'600001',altPhone:'+91 9000000001',bedrooms:'3',bathrooms:'2',parking:'1',furnishing:'Fully furnished',language:'Tamil',contactMethod:'Phone',contactTime:'Evening'}});check(response.status===200,state+' owner request accepted');const saved=await (await get('detail&id='+(await response.json()).id)).json();check(saved.request.state===state&&JSON.parse(saved.request.details).altPhone==='+91 9000000001'&&JSON.parse(saved.request.details).address==='Private address','Structured location and contact details persisted for '+state);}
+for(const patch of [{state:'Other'},{details:{pincode:'123'}},{details:{altPhone:'invalid'}},{details:{bedrooms:'-1'}}])check((await post({action:'submit',mode:'Sell',type:'House',budget:1,name:'QA',phone:'9000000000',consent:true,...patch})).status===400,'Invalid state / structured detail rejected');
+const photo=new FormData();photo.set('request',id);photo.set('file',new File([new Uint8Array([137,80,78,71,13,10,26,10])],'qa.png',{type:'image/png'}));const pr=await post(photo);check(pr.status===200,'Private photo accepted');const photoId=(await pr.json()).id;check((await get('file&preview=1&id='+photoId)).headers.get('Content-Disposition').startsWith('inline'),'Owner photo renders inline');check((await get('file&preview=1&id='+fid)).headers.get('Content-Disposition').startsWith('attachment'),'PDF remains a download');who('bob');check((await get('file&preview=1&id='+photoId)).status===404,'Other customer cannot access inline photo');
+console.log(`${count} assertions passed. SQLite/API integration only; live sign-in and deployment not tested.`);
+})().catch(e=>{console.error(e);process.exitCode=1});
