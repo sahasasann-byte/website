@@ -1,0 +1,17 @@
+KING BRO V2 — GITHUB + RENDER + APK
+
+GITHUB: extract ZIP -> upload ALL contents to repo root -> commit main.
+
+RENDER: use WEB SERVICE (not Static Site).
+Best: New -> Blueprint -> connect repo (render.yaml included).
+Manual: Root Directory web
+Build: corepack enable && pnpm install --frozen-lockfile && pnpm build
+Start: pnpm start
+Node 22.13.0
+
+APK: GitHub -> Actions -> Build KING BRO Android APK -> Run workflow.
+Default URL: https://kingbro-90dw.onrender.com
+After green run -> Artifacts -> KING-BRO-Android-APK -> extract app-debug.apk.
+
+APK is a Flutter WebView wrapper of the hosted KING BRO website, not a native feature-by-feature rewrite.
+The supplied web source uses Cloudflare-style D1/R2/ChatGPT identity bindings. Render does not automatically provide those services; production auth/persistence/private storage need compatible backend integration.
